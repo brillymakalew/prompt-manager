@@ -25,6 +25,7 @@ model User {
 
   templates    Template[]
   presets      Preset[]
+  prompt       Prompt[]
 }
 
 model Session {
