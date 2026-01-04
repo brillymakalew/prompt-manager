@@ -84,6 +84,7 @@ async function callOpenAIJsonEdit(args: {
     text: {
       format: {
         type: 'json_schema' as const,
+        name: 'json_edit_result', // ✅ WAJIB
         strict: true,
         schema: {
           type: 'object',
@@ -97,6 +98,7 @@ async function callOpenAIJsonEdit(args: {
         }
       }
     },
+
     max_output_tokens: 1200,
     input: [
       { role: 'system', content: system + ' IMPORTANT: output must be JSON.' },
