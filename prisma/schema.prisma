@@ -1,0 +1,134 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String?
+  passwordHash String
+  role         Role      @default(ADMIN)
+  sessions     Session[]
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  templates    Template[]
+  presets      Preset[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Template {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  schemaJson  Json?
+  exampleJson Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  presets Preset[]
+
+  @@index([userId])
+}
+
+model Preset {
+  id         String   @id @default(cuid())
+  userId     String
+  templateId String
+  name       String
+  presetJson Json
+  lockJson   Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([templateId])
+}
+
+model Prompt {
+  id               String         @id @default(cuid())
+  userId           String
+  title            String
+  tags             String[]
+  currentVersionId String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions PromptVersion[]
+  images   ImageAsset[]
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model PromptVersion {
+  id            String   @id @default(cuid())
+  promptId      String
+  versionNo     Int
+  promptJson    Json
+  generatedText String
+  createdAt     DateTime @default(now())
+
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  images ImageAsset[]
+
+  @@unique([promptId, versionNo])
+  @@index([promptId])
+  @@index([createdAt])
+}
+
+model ImageAsset {
+  id             String   @id @default(cuid())
+  promptId       String
+  promptVersionId String?
+
+  storagePath    String
+  originalName   String
+  mimeType       String
+  sizeBytes      Int
+  width          Int?
+  height         Int?
+
+  modelName      String?
+  seed           String?
+  rating         Int?
+  notes          String?
+
+  createdAt      DateTime @default(now())
+
+  prompt        Prompt        @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  promptVersion PromptVersion? @relation(fields: [promptVersionId], references: [id], onDelete: SetNull)
+
+  @@index([promptId])
+  @@index([promptVersionId])
+  @@index([createdAt])
+}
