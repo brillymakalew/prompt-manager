@@ -37,41 +37,6 @@ function extractOutputText(data: ResponsesApiResponse): string {
   return chunks.join('\n').trim();
 }
 
-// Put these near the top of the file (outside the function)
-type ResponsesApiMessage = {
-  type: 'message';
-  role?: string;
-  content?: Array<{ type?: string; text?: string }>;
-};
-
-type ResponsesApiResponse = {
-  status?: string;
-  error?: any;
-  output?: Array<ResponsesApiMessage | any>;
-};
-
-function extractOutputText(data: ResponsesApiResponse): string {
-  if (!data?.output || !Array.isArray(data.output)) return '';
-
-  const chunks: string[] = [];
-  for (const item of data.output) {
-    if (item?.type !== 'message') continue;
-    if (item?.role !== 'assistant') continue;
-    if (!Array.isArray(item.content)) continue;
-
-    for (const c of item.content) {
-      if (c?.type === 'output_text' && typeof c.text === 'string') {
-        chunks.push(c.text);
-      }
-    }
-  }
-  return chunks.join('\n').trim();
-}
-
-/**
- * Calls OpenAI Responses API to edit a JSON prompt based on instruction.
- * Returns a validated object: { updatedJson, summary, changedPaths }.
- */
 async function callOpenAIJsonEdit(args: {
   apiKey: string;
   model: string;
@@ -104,7 +69,6 @@ async function callOpenAIJsonEdit(args: {
       'global_negative_prompt'
     ],
     commonAdditions: {
-      // Example: "tambah profil body" -> add body.profile
       bodyProfileTemplate: {
         height: '',
         build: '',
@@ -116,11 +80,10 @@ async function callOpenAIJsonEdit(args: {
 
   const payload = {
     model,
-    reasoning: { effort: 'low' },
-    // ✅ Use strict JSON schema output (more reliable than json_object)
+    reasoning: { effort: 'low' as const },
     text: {
       format: {
-        type: 'json_schema',
+        type: 'json_schema' as const,
         strict: true,
         schema: {
           type: 'object',
@@ -167,7 +130,6 @@ async function callOpenAIJsonEdit(args: {
     throw new Error(`OpenAI returned empty output. status=${status} ${err}`);
   }
 
-  // Parse and validate response JSON
   let parsed: any;
   try {
     parsed = JSON.parse(out);
@@ -182,16 +144,16 @@ async function callOpenAIJsonEdit(args: {
   }
 
   const summary = typeof parsed?.summary === 'string' ? parsed.summary : '';
-  const changedPaths = Array.isArray(parsed?.changedPaths) ? parsed.changedPaths : [];
+  const changedPaths = Array.isArray(parsed?.changedPaths)
+    ? parsed.changedPaths.filter((x: any) => typeof x === 'string')
+    : [];
 
-  // Enforce types
   return {
     updatedJson: updatedJson as Record<string, any>,
     summary,
-    changedPaths: changedPaths.filter((x: any) => typeof x === 'string')
+    changedPaths
   };
 }
-
 
 export async function POST(req: Request) {
   const user = await getCurrentUser();
@@ -201,7 +163,10 @@ export async function POST(req: Request) {
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ ok: false, error: 'Missing OPENAI_API_KEY in environment' }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: 'Missing OPENAI_API_KEY in environment' },
+      { status: 500 }
+    );
   }
 
   const model = process.env.OPENAI_MODEL || 'gpt-5';
@@ -217,29 +182,19 @@ export async function POST(req: Request) {
   }
 
   try {
-    const raw = await callOpenAIJsonEdit({
+    const result = await callOpenAIJsonEdit({
       apiKey,
       model,
       instruction: body.instruction,
       currentJson: body.currentJson
     });
 
-    const parsed = JSON.parse(raw);
-    const updatedJson = parsed?.updatedJson;
-
-    if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
-      return NextResponse.json(
-        { ok: false, error: 'Model output did not include updatedJson as an object', raw },
-        { status: 502 }
-      );
-    }
-
     return NextResponse.json(
       {
         ok: true,
-        updatedJson,
-        summary: typeof parsed?.summary === 'string' ? parsed.summary : '',
-        changedPaths: Array.isArray(parsed?.changedPaths) ? parsed.changedPaths : []
+        updatedJson: result.updatedJson,
+        summary: result.summary,
+        changedPaths: result.changedPaths
       },
       { status: 200 }
     );
