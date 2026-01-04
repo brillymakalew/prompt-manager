@@ -7,11 +7,35 @@ const BodySchema = z.object({
   currentJson: z.unknown()
 });
 
-type OpenAIResponse = {
-  output_text?: string;
+type ResponsesApiMessage = {
+  type: 'message';
+  role?: string;
+  content?: Array<{ type?: string; text?: string }>;
+};
+
+type ResponsesApiResponse = {
   status?: string;
   error?: any;
+  output?: Array<ResponsesApiMessage | any>;
 };
+
+function extractOutputText(data: ResponsesApiResponse): string {
+  if (!data?.output || !Array.isArray(data.output)) return '';
+
+  const chunks: string[] = [];
+  for (const item of data.output) {
+    if (item?.type !== 'message') continue;
+    if (item?.role !== 'assistant') continue;
+    if (!Array.isArray(item.content)) continue;
+
+    for (const c of item.content) {
+      if (c?.type === 'output_text' && typeof c.text === 'string') {
+        chunks.push(c.text);
+      }
+    }
+  }
+  return chunks.join('\n').trim();
+}
 
 async function callOpenAIJsonEdit(args: {
   apiKey: string;
@@ -30,8 +54,6 @@ async function callOpenAIJsonEdit(args: {
     'keep strings concise; use Indonesian for summary. ' +
     'If instruction is ambiguous, make a reasonable minimal addition (e.g., create fields with empty strings) and mention it in summary.';
 
-  // Helpful conventions for this app's prompt schema.
-  // We intentionally keep this lightweight: the model can adapt to whatever shape it sees.
   const conventions = {
     knownSections: [
       'character',
@@ -47,7 +69,6 @@ async function callOpenAIJsonEdit(args: {
       'global_negative_prompt'
     ],
     commonAdditions: {
-      // Example: "tambah profil body" -> add body.profile
       bodyProfileTemplate: {
         height: '',
         build: '',
@@ -60,22 +81,13 @@ async function callOpenAIJsonEdit(args: {
   const payload = {
     model,
     reasoning: { effort: 'low' },
-    // JSON mode: ensure valid JSON output.
     text: { format: { type: 'json_object' } },
     max_output_tokens: 1200,
     input: [
       { role: 'system', content: system + ' IMPORTANT: output must be JSON.' },
       {
         role: 'user',
-        content: JSON.stringify(
-          {
-            instruction,
-            currentJson,
-            conventions
-          },
-          null,
-          2
-        )
+        content: JSON.stringify({ instruction, currentJson, conventions }, null, 2)
       }
     ]
   };
@@ -94,9 +106,15 @@ async function callOpenAIJsonEdit(args: {
     throw new Error(`OpenAI API error (${res.status}): ${text}`);
   }
 
-  const data = (await res.json()) as OpenAIResponse;
-  const out = data.output_text ?? '';
-  if (!out.trim()) throw new Error('OpenAI returned empty output_text');
+  const data = (await res.json()) as ResponsesApiResponse;
+  const out = extractOutputText(data);
+
+  if (!out) {
+    const status = data?.status ?? 'unknown';
+    const err = data?.error ? JSON.stringify(data.error) : '';
+    throw new Error(`OpenAI returned empty output. status=${status} ${err}`);
+  }
+
   return out;
 }
 
@@ -108,10 +126,7 @@ export async function POST(req: Request) {
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json(
-      { ok: false, error: 'Missing OPENAI_API_KEY in environment' },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: 'Missing OPENAI_API_KEY in environment' }, { status: 500 });
   }
 
   const model = process.env.OPENAI_MODEL || 'gpt-5';
@@ -120,7 +135,10 @@ export async function POST(req: Request) {
   try {
     body = BodySchema.parse(await req.json());
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: 'Invalid request body', details: e?.message }, { status: 400 });
+    return NextResponse.json(
+      { ok: false, error: 'Invalid request body', details: e?.message },
+      { status: 400 }
+    );
   }
 
   try {
@@ -133,13 +151,10 @@ export async function POST(req: Request) {
 
     const parsed = JSON.parse(raw);
     const updatedJson = parsed?.updatedJson;
+
     if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: 'Model output did not include updatedJson as an object',
-          raw
-        },
+        { ok: false, error: 'Model output did not include updatedJson as an object', raw },
         { status: 502 }
       );
     }
