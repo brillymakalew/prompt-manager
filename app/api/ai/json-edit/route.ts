@@ -7,6 +7,18 @@ const BodySchema = z.object({
   currentJson: z.unknown()
 });
 
+/**
+ * Model will return PATCH operations, NOT the full JSON.
+ * We'll apply ops on server to produce updatedJson.
+ */
+type PatchOp = {
+  op: 'add' | 'replace' | 'remove';
+  // JSON Pointer path, e.g. "/body/profile/height"
+  path: string;
+  // JSON string representing the value (required for add/replace)
+  valueText?: string;
+};
+
 type ResponsesApiMessage = {
   type: 'message';
   role?: string;
@@ -17,17 +29,12 @@ type ResponsesApiResponse = {
   status?: string;
   error?: any;
   output?: Array<ResponsesApiMessage | any>;
-  // some SDKs/variants might include this; harmless as fallback
   output_text?: string;
 };
 
 function extractOutputText(data: ResponsesApiResponse): string {
-  // Fallback if some runtime includes output_text
-  if (typeof data?.output_text === 'string' && data.output_text.trim()) {
-    return data.output_text.trim();
-  }
-
-  if (!data?.output || !Array.isArray(data.output)) return '';
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) return data.output_text.trim();
+  if (!Array.isArray(data?.output)) return '';
 
   const chunks: string[] = [];
   for (const item of data.output) {
@@ -36,35 +43,144 @@ function extractOutputText(data: ResponsesApiResponse): string {
     if (!Array.isArray(item.content)) continue;
 
     for (const c of item.content) {
-      if (c?.type === 'output_text' && typeof c.text === 'string') {
-        chunks.push(c.text);
-      }
+      if (c?.type === 'output_text' && typeof c.text === 'string') chunks.push(c.text);
     }
   }
   return chunks.join('\n').trim();
 }
 
-async function callOpenAIJsonEdit(args: {
+function deepClone<T>(v: T): T {
+  // Node 18+ supports structuredClone
+  // @ts-ignore
+  if (typeof structuredClone === 'function') return structuredClone(v);
+  return JSON.parse(JSON.stringify(v));
+}
+
+function decodeJsonPointerSegment(seg: string): string {
+  return seg.replace(/~1/g, '/').replace(/~0/g, '~');
+}
+
+function splitJsonPointer(pointer: string): string[] {
+  if (!pointer || pointer === '/') return [];
+  if (!pointer.startsWith('/')) throw new Error(`Invalid JSON pointer (must start with "/"): ${pointer}`);
+  return pointer
+    .split('/')
+    .slice(1)
+    .map(decodeJsonPointerSegment);
+}
+
+function isArrayIndex(seg: string): boolean {
+  return seg === '-' || /^[0-9]+$/.test(seg);
+}
+
+function ensureContainer(nextSeg: string): any {
+  // If next segment looks like array index, create array, else object
+  return isArrayIndex(nextSeg) ? [] : {};
+}
+
+/**
+ * Applies a small subset of JSON Patch with "add|replace|remove" and JSON Pointer paths.
+ * Supports creating intermediate objects/arrays for "add"/"replace".
+ */
+function applyOps(currentJson: unknown, ops: PatchOp[]): any {
+  const root = deepClone(currentJson);
+
+  for (const op of ops) {
+    const segments = splitJsonPointer(op.path);
+    if (segments.length === 0) {
+      // Root replacement/removal is dangerous; handle minimally
+      if (op.op === 'remove') throw new Error('Refusing to remove root object');
+      if (op.op === 'add' || op.op === 'replace') {
+        if (typeof op.valueText !== 'string') throw new Error(`Missing valueText for ${op.op} at ${op.path}`);
+        const val = JSON.parse(op.valueText);
+        return val;
+      }
+      continue;
+    }
+
+    // Walk to parent
+    let cursor: any = root;
+    for (let i = 0; i < segments.length - 1; i++) {
+      const key = segments[i];
+      const nextKey = segments[i + 1];
+
+      if (Array.isArray(cursor)) {
+        // key must be numeric
+        if (!/^[0-9]+$/.test(key)) throw new Error(`Array path segment must be numeric, got "${key}" in ${op.path}`);
+        const idx = Number(key);
+        if (cursor[idx] == null) cursor[idx] = ensureContainer(nextKey);
+        cursor = cursor[idx];
+      } else {
+        if (cursor[key] == null || typeof cursor[key] !== 'object') {
+          cursor[key] = ensureContainer(nextKey);
+        }
+        cursor = cursor[key];
+      }
+    }
+
+    const last = segments[segments.length - 1];
+
+    if (op.op === 'remove') {
+      if (Array.isArray(cursor)) {
+        if (!/^[0-9]+$/.test(last)) throw new Error(`Array remove index must be numeric, got "${last}" in ${op.path}`);
+        const idx = Number(last);
+        cursor.splice(idx, 1);
+      } else {
+        delete cursor[last];
+      }
+      continue;
+    }
+
+    // add / replace
+    if (typeof op.valueText !== 'string') throw new Error(`Missing valueText for ${op.op} at ${op.path}`);
+
+    let value: any;
+    try {
+      value = JSON.parse(op.valueText);
+    } catch (e: any) {
+      throw new Error(`valueText is not valid JSON for ${op.path}: ${e?.message}`);
+    }
+
+    if (Array.isArray(cursor)) {
+      if (last === '-') {
+        cursor.push(value);
+      } else {
+        if (!/^[0-9]+$/.test(last)) throw new Error(`Array index must be numeric or "-", got "${last}" in ${op.path}`);
+        const idx = Number(last);
+        if (op.op === 'add') cursor.splice(idx, 0, value);
+        else cursor[idx] = value; // replace
+      }
+    } else {
+      cursor[last] = value;
+    }
+  }
+
+  return root;
+}
+
+async function callOpenAIPatchOps(args: {
   apiKey: string;
   model: string;
   instruction: string;
   currentJson: unknown;
-}): Promise<{ updatedJson: Record<string, any>; summary: string; changedPaths: string[] }> {
+}): Promise<{ ops: PatchOp[]; summary: string; changedPaths: string[] }> {
   const { apiKey, model, instruction, currentJson } = args;
 
   const system =
-    'You are a JSON editor. Update a prompt JSON object based on the user instruction.\n' +
-    'Return ONLY valid JSON (no markdown, no commentary).\n' +
-    'Your output MUST be an object with keys:\n' +
-    '- updatedJsonText: string (this must be a JSON string of the UPDATED object)\n' +
+    'You are a JSON editor that outputs JSON Patch-like operations.\n' +
+    'Given instruction and currentJson, produce ONLY a JSON object with keys:\n' +
+    '- ops: array of operations\n' +
     '- summary: string (Indonesian)\n' +
-    '- changedPaths: array of strings (dot-paths like "body.profile.height")\n' +
+    '- changedPaths: array of strings (dot paths)\n' +
+    'Operation format:\n' +
+    '- op: "add" | "replace" | "remove"\n' +
+    '- path: JSON Pointer path like "/body/profile/height"\n' +
+    '- valueText: (required for add/replace) MUST be a JSON string representing the value (e.g. "\"abc\"" for string, "123" for number, "{...}" for object).\n' +
     'Rules:\n' +
-    '- Preserve existing structure/values unless instruction asks to change.\n' +
-    '- Add new keys in the most appropriate section.\n' +
-    '- Do not remove data unless explicitly requested.\n' +
-    '- Keep strings concise.\n' +
-    '- If instruction is ambiguous, do minimal addition and mention it in summary.\n';
+    '- Keep ops minimal (only what changes).\n' +
+    '- Preserve everything else.\n' +
+    '- If instruction is ambiguous, do minimal addition and mention it in summary.\n' +
+    '- Do NOT output the full updated JSON.\n';
 
   const conventions = {
     knownSections: [
@@ -81,7 +197,6 @@ async function callOpenAIJsonEdit(args: {
       'global_negative_prompt'
     ],
     commonAdditions: {
-      // Example: "tambah profil body" -> add body.profile
       bodyProfileTemplate: {
         height: '',
         build: '',
@@ -97,34 +212,38 @@ async function callOpenAIJsonEdit(args: {
     text: {
       format: {
         type: 'json_schema' as const,
-        name: 'json_edit_result_v1',
+        name: 'json_patch_ops_v1',
         strict: true,
         schema: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            updatedJsonText: { type: 'string' },
+            ops: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  op: { type: 'string', enum: ['add', 'replace', 'remove'] },
+                  path: { type: 'string' },
+                  valueText: { type: 'string' }
+                },
+                required: ['op', 'path']
+              }
+            },
             summary: { type: 'string' },
             changedPaths: { type: 'array', items: { type: 'string' } }
           },
-          required: ['updatedJsonText', 'summary', 'changedPaths']
+          required: ['ops', 'summary', 'changedPaths']
         }
       }
     },
-    max_output_tokens: 1200,
+    max_output_tokens: 700,
     input: [
       { role: 'system', content: system },
       {
         role: 'user',
-        content: JSON.stringify(
-          {
-            instruction,
-            currentJson,
-            conventions
-          },
-          null,
-          2
-        )
+        content: JSON.stringify({ instruction, currentJson, conventions }, null, 2)
       }
     ]
   };
@@ -144,15 +263,19 @@ async function callOpenAIJsonEdit(args: {
   }
 
   const data = (await res.json()) as ResponsesApiResponse;
-  const out = extractOutputText(data);
 
-  if (!out) {
-    const status = data?.status ?? 'unknown';
+  // If status is present and not completed, fail early (avoids truncated JSON)
+  if (data?.status && data.status !== 'completed') {
     const err = data?.error ? JSON.stringify(data.error) : '';
-    throw new Error(`OpenAI returned empty output. status=${status} ${err}`);
+    throw new Error(`OpenAI response not completed. status=${data.status} ${err}`);
   }
 
-  // Parse the model output JSON (outer object)
+  const out = extractOutputText(data);
+  if (!out) {
+    const err = data?.error ? JSON.stringify(data.error) : '';
+    throw new Error(`OpenAI returned empty output. ${err}`);
+  }
+
   let parsed: any;
   try {
     parsed = JSON.parse(out);
@@ -161,48 +284,39 @@ async function callOpenAIJsonEdit(args: {
     throw new Error(`Model returned invalid JSON: ${e?.message}. Tail: ${tail}`);
   }
 
-  const updatedJsonText = parsed?.updatedJsonText;
-  if (typeof updatedJsonText !== 'string' || !updatedJsonText.trim()) {
-    throw new Error('Model output did not include updatedJsonText as a non-empty string');
-  }
-
-  // Parse updatedJsonText into object
-  let updatedJson: any;
-  try {
-    updatedJson = JSON.parse(updatedJsonText);
-  } catch (e: any) {
-    const tail = updatedJsonText.slice(Math.max(0, updatedJsonText.length - 500));
-    throw new Error(`updatedJsonText is not valid JSON: ${e?.message}. Tail: ${tail}`);
-  }
-
-  if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
-    throw new Error('updatedJsonText did not parse into a JSON object');
-  }
-
+  const ops = Array.isArray(parsed?.ops) ? parsed.ops : [];
   const summary = typeof parsed?.summary === 'string' ? parsed.summary : '';
   const changedPaths = Array.isArray(parsed?.changedPaths)
     ? parsed.changedPaths.filter((x: any) => typeof x === 'string')
     : [];
 
-  return {
-    updatedJson: updatedJson as Record<string, any>,
-    summary,
-    changedPaths
-  };
+  // Normalize ops
+  const normOps: PatchOp[] = ops
+    .map((o: any) => ({
+      op: o?.op,
+      path: o?.path,
+      valueText: o?.valueText
+    }))
+    .filter((o: any) => (o.op === 'add' || o.op === 'replace' || o.op === 'remove') && typeof o.path === 'string');
+
+  // Enforce valueText on add/replace
+  for (const o of normOps) {
+    if ((o.op === 'add' || o.op === 'replace') && typeof o.valueText !== 'string') {
+      // allow empty string but must exist
+      o.valueText = JSON.stringify(null);
+    }
+  }
+
+  return { ops: normOps, summary, changedPaths };
 }
 
 export async function POST(req: Request) {
   const user = await getCurrentUser();
-  if (!user) {
-    return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
-  }
+  if (!user) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json(
-      { ok: false, error: 'Missing OPENAI_API_KEY in environment' },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: 'Missing OPENAI_API_KEY in environment' }, { status: 500 });
   }
 
   const model = process.env.OPENAI_MODEL || 'gpt-5';
@@ -218,26 +332,46 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await callOpenAIJsonEdit({
+    const { ops, summary, changedPaths } = await callOpenAIPatchOps({
       apiKey,
       model,
       instruction: body.instruction,
       currentJson: body.currentJson
     });
 
+    const updatedJson = applyOps(body.currentJson, ops);
+
+    // Ensure updatedJson is an object (the app expects object)
+    if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
+      return NextResponse.json(
+        { ok: false, error: 'Patch application produced non-object JSON', ops },
+        { status: 502 }
+      );
+    }
+
+    // If model didn't provide changedPaths, derive from ops (simple best-effort)
+    const derivedPaths =
+      changedPaths.length > 0
+        ? changedPaths
+        : ops.map((o) =>
+            o.path
+              .replace(/^\//, '')
+              .split('/')
+              .filter(Boolean)
+              .map((s) => decodeJsonPointerSegment(s))
+              .join('.')
+          );
+
     return NextResponse.json(
       {
         ok: true,
-        updatedJson: result.updatedJson,
-        summary: result.summary,
-        changedPaths: result.changedPaths
+        updatedJson,
+        summary,
+        changedPaths: derivedPaths
       },
       { status: 200 }
     );
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: e?.message || 'Failed to generate JSON edit' },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e?.message || 'Failed to generate JSON edit' }, { status: 500 });
   }
 }
