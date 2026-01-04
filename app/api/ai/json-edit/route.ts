@@ -37,12 +37,47 @@ function extractOutputText(data: ResponsesApiResponse): string {
   return chunks.join('\n').trim();
 }
 
+// Put these near the top of the file (outside the function)
+type ResponsesApiMessage = {
+  type: 'message';
+  role?: string;
+  content?: Array<{ type?: string; text?: string }>;
+};
+
+type ResponsesApiResponse = {
+  status?: string;
+  error?: any;
+  output?: Array<ResponsesApiMessage | any>;
+};
+
+function extractOutputText(data: ResponsesApiResponse): string {
+  if (!data?.output || !Array.isArray(data.output)) return '';
+
+  const chunks: string[] = [];
+  for (const item of data.output) {
+    if (item?.type !== 'message') continue;
+    if (item?.role !== 'assistant') continue;
+    if (!Array.isArray(item.content)) continue;
+
+    for (const c of item.content) {
+      if (c?.type === 'output_text' && typeof c.text === 'string') {
+        chunks.push(c.text);
+      }
+    }
+  }
+  return chunks.join('\n').trim();
+}
+
+/**
+ * Calls OpenAI Responses API to edit a JSON prompt based on instruction.
+ * Returns a validated object: { updatedJson, summary, changedPaths }.
+ */
 async function callOpenAIJsonEdit(args: {
   apiKey: string;
   model: string;
   instruction: string;
   currentJson: unknown;
-}) {
+}): Promise<{ updatedJson: Record<string, any>; summary: string; changedPaths: string[] }> {
   const { apiKey, model, instruction, currentJson } = args;
 
   const system =
@@ -69,6 +104,7 @@ async function callOpenAIJsonEdit(args: {
       'global_negative_prompt'
     ],
     commonAdditions: {
+      // Example: "tambah profil body" -> add body.profile
       bodyProfileTemplate: {
         height: '',
         build: '',
@@ -81,7 +117,23 @@ async function callOpenAIJsonEdit(args: {
   const payload = {
     model,
     reasoning: { effort: 'low' },
-    text: { format: { type: 'json_object' } },
+    // ✅ Use strict JSON schema output (more reliable than json_object)
+    text: {
+      format: {
+        type: 'json_schema',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            updatedJson: { type: 'object' },
+            summary: { type: 'string' },
+            changedPaths: { type: 'array', items: { type: 'string' } }
+          },
+          required: ['updatedJson', 'summary', 'changedPaths']
+        }
+      }
+    },
     max_output_tokens: 1200,
     input: [
       { role: 'system', content: system + ' IMPORTANT: output must be JSON.' },
@@ -115,8 +167,31 @@ async function callOpenAIJsonEdit(args: {
     throw new Error(`OpenAI returned empty output. status=${status} ${err}`);
   }
 
-  return out;
+  // Parse and validate response JSON
+  let parsed: any;
+  try {
+    parsed = JSON.parse(out);
+  } catch (e: any) {
+    const tail = out.slice(Math.max(0, out.length - 400));
+    throw new Error(`Model returned invalid JSON: ${e?.message}. Tail: ${tail}`);
+  }
+
+  const updatedJson = parsed?.updatedJson;
+  if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
+    throw new Error('Model output did not include updatedJson as an object');
+  }
+
+  const summary = typeof parsed?.summary === 'string' ? parsed.summary : '';
+  const changedPaths = Array.isArray(parsed?.changedPaths) ? parsed.changedPaths : [];
+
+  // Enforce types
+  return {
+    updatedJson: updatedJson as Record<string, any>,
+    summary,
+    changedPaths: changedPaths.filter((x: any) => typeof x === 'string')
+  };
 }
+
 
 export async function POST(req: Request) {
   const user = await getCurrentUser();
