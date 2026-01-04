@@ -7,16 +7,10 @@ const BodySchema = z.object({
   currentJson: z.unknown()
 });
 
-/**
- * Model will return PATCH operations, NOT the full JSON.
- * We'll apply ops on server to produce updatedJson.
- */
 type PatchOp = {
   op: 'add' | 'replace' | 'remove';
-  // JSON Pointer path, e.g. "/body/profile/height"
-  path: string;
-  // JSON string representing the value (required for add/replace)
-  valueText?: string;
+  path: string;       // JSON Pointer, e.g. "/body/profile/height"
+  valueText: string;  // required by schema; for remove use "null"
 };
 
 type ResponsesApiMessage = {
@@ -50,7 +44,6 @@ function extractOutputText(data: ResponsesApiResponse): string {
 }
 
 function deepClone<T>(v: T): T {
-  // Node 18+ supports structuredClone
   // @ts-ignore
   if (typeof structuredClone === 'function') return structuredClone(v);
   return JSON.parse(JSON.stringify(v));
@@ -74,39 +67,28 @@ function isArrayIndex(seg: string): boolean {
 }
 
 function ensureContainer(nextSeg: string): any {
-  // If next segment looks like array index, create array, else object
   return isArrayIndex(nextSeg) ? [] : {};
 }
 
-/**
- * Applies a small subset of JSON Patch with "add|replace|remove" and JSON Pointer paths.
- * Supports creating intermediate objects/arrays for "add"/"replace".
- */
 function applyOps(currentJson: unknown, ops: PatchOp[]): any {
   const root = deepClone(currentJson);
 
   for (const op of ops) {
     const segments = splitJsonPointer(op.path);
+
     if (segments.length === 0) {
-      // Root replacement/removal is dangerous; handle minimally
       if (op.op === 'remove') throw new Error('Refusing to remove root object');
-      if (op.op === 'add' || op.op === 'replace') {
-        if (typeof op.valueText !== 'string') throw new Error(`Missing valueText for ${op.op} at ${op.path}`);
-        const val = JSON.parse(op.valueText);
-        return val;
-      }
-      continue;
+      const val = JSON.parse(op.valueText);
+      return val;
     }
 
-    // Walk to parent
     let cursor: any = root;
     for (let i = 0; i < segments.length - 1; i++) {
       const key = segments[i];
       const nextKey = segments[i + 1];
 
       if (Array.isArray(cursor)) {
-        // key must be numeric
-        if (!/^[0-9]+$/.test(key)) throw new Error(`Array path segment must be numeric, got "${key}" in ${op.path}`);
+        if (!/^[0-9]+$/.test(key)) throw new Error(`Array segment must be numeric, got "${key}" in ${op.path}`);
         const idx = Number(key);
         if (cursor[idx] == null) cursor[idx] = ensureContainer(nextKey);
         cursor = cursor[idx];
@@ -131,15 +113,7 @@ function applyOps(currentJson: unknown, ops: PatchOp[]): any {
       continue;
     }
 
-    // add / replace
-    if (typeof op.valueText !== 'string') throw new Error(`Missing valueText for ${op.op} at ${op.path}`);
-
-    let value: any;
-    try {
-      value = JSON.parse(op.valueText);
-    } catch (e: any) {
-      throw new Error(`valueText is not valid JSON for ${op.path}: ${e?.message}`);
-    }
+    const value = JSON.parse(op.valueText);
 
     if (Array.isArray(cursor)) {
       if (last === '-') {
@@ -172,14 +146,13 @@ async function callOpenAIPatchOps(args: {
     '- ops: array of operations\n' +
     '- summary: string (Indonesian)\n' +
     '- changedPaths: array of strings (dot paths)\n' +
-    'Operation format:\n' +
+    'Each operation MUST include:\n' +
     '- op: "add" | "replace" | "remove"\n' +
-    '- path: JSON Pointer path like "/body/profile/height"\n' +
-    '- valueText: (required for add/replace) MUST be a JSON string representing the value (e.g. "\"abc\"" for string, "123" for number, "{...}" for object).\n' +
+    '- path: JSON Pointer (e.g. "/body/profile/height")\n' +
+    '- valueText: string (MUST be valid JSON text representing the value; for remove use "null")\n' +
     'Rules:\n' +
-    '- Keep ops minimal (only what changes).\n' +
+    '- Keep ops minimal.\n' +
     '- Preserve everything else.\n' +
-    '- If instruction is ambiguous, do minimal addition and mention it in summary.\n' +
     '- Do NOT output the full updated JSON.\n';
 
   const conventions = {
@@ -228,7 +201,8 @@ async function callOpenAIPatchOps(args: {
                   path: { type: 'string' },
                   valueText: { type: 'string' }
                 },
-                required: ['op', 'path']
+                // ✅ required MUST include all keys present in properties
+                required: ['op', 'path', 'valueText']
               }
             },
             summary: { type: 'string' },
@@ -241,10 +215,7 @@ async function callOpenAIPatchOps(args: {
     max_output_tokens: 700,
     input: [
       { role: 'system', content: system },
-      {
-        role: 'user',
-        content: JSON.stringify({ instruction, currentJson, conventions }, null, 2)
-      }
+      { role: 'user', content: JSON.stringify({ instruction, currentJson, conventions }, null, 2) }
     ]
   };
 
@@ -263,18 +234,13 @@ async function callOpenAIPatchOps(args: {
   }
 
   const data = (await res.json()) as ResponsesApiResponse;
-
-  // If status is present and not completed, fail early (avoids truncated JSON)
   if (data?.status && data.status !== 'completed') {
     const err = data?.error ? JSON.stringify(data.error) : '';
     throw new Error(`OpenAI response not completed. status=${data.status} ${err}`);
   }
 
   const out = extractOutputText(data);
-  if (!out) {
-    const err = data?.error ? JSON.stringify(data.error) : '';
-    throw new Error(`OpenAI returned empty output. ${err}`);
-  }
+  if (!out) throw new Error('OpenAI returned empty output');
 
   let parsed: any;
   try {
@@ -284,30 +250,21 @@ async function callOpenAIPatchOps(args: {
     throw new Error(`Model returned invalid JSON: ${e?.message}. Tail: ${tail}`);
   }
 
-  const ops = Array.isArray(parsed?.ops) ? parsed.ops : [];
+  const opsRaw = Array.isArray(parsed?.ops) ? parsed.ops : [];
+  const ops: PatchOp[] = opsRaw
+    .map((o: any) => ({
+      op: o?.op,
+      path: o?.path,
+      valueText: typeof o?.valueText === 'string' ? o.valueText : 'null'
+    }))
+    .filter((o: any) => (o.op === 'add' || o.op === 'replace' || o.op === 'remove') && typeof o.path === 'string');
+
   const summary = typeof parsed?.summary === 'string' ? parsed.summary : '';
   const changedPaths = Array.isArray(parsed?.changedPaths)
     ? parsed.changedPaths.filter((x: any) => typeof x === 'string')
     : [];
 
-  // Normalize ops
-  const normOps: PatchOp[] = ops
-    .map((o: any) => ({
-      op: o?.op,
-      path: o?.path,
-      valueText: o?.valueText
-    }))
-    .filter((o: any) => (o.op === 'add' || o.op === 'replace' || o.op === 'remove') && typeof o.path === 'string');
-
-  // Enforce valueText on add/replace
-  for (const o of normOps) {
-    if ((o.op === 'add' || o.op === 'replace') && typeof o.valueText !== 'string') {
-      // allow empty string but must exist
-      o.valueText = JSON.stringify(null);
-    }
-  }
-
-  return { ops: normOps, summary, changedPaths };
+  return { ops, summary, changedPaths };
 }
 
 export async function POST(req: Request) {
@@ -341,15 +298,10 @@ export async function POST(req: Request) {
 
     const updatedJson = applyOps(body.currentJson, ops);
 
-    // Ensure updatedJson is an object (the app expects object)
     if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
-      return NextResponse.json(
-        { ok: false, error: 'Patch application produced non-object JSON', ops },
-        { status: 502 }
-      );
+      return NextResponse.json({ ok: false, error: 'Patch produced non-object JSON', ops }, { status: 502 });
     }
 
-    // If model didn't provide changedPaths, derive from ops (simple best-effort)
     const derivedPaths =
       changedPaths.length > 0
         ? changedPaths
@@ -363,12 +315,7 @@ export async function POST(req: Request) {
           );
 
     return NextResponse.json(
-      {
-        ok: true,
-        updatedJson,
-        summary,
-        changedPaths: derivedPaths
-      },
+      { ok: true, updatedJson, summary, changedPaths: derivedPaths },
       { status: 200 }
     );
   } catch (e: any) {
