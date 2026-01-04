@@ -11,3 +11,5 @@ COPY . .
 EXPOSE 3000
 
 CMD ["npm", "run", "dev"]
+
+RUN apk add --no-cache openssl
