@@ -17,9 +17,16 @@ type ResponsesApiResponse = {
   status?: string;
   error?: any;
   output?: Array<ResponsesApiMessage | any>;
+  // some SDKs/variants might include this; harmless as fallback
+  output_text?: string;
 };
 
 function extractOutputText(data: ResponsesApiResponse): string {
+  // Fallback if some runtime includes output_text
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
   if (!data?.output || !Array.isArray(data.output)) return '';
 
   const chunks: string[] = [];
@@ -46,13 +53,18 @@ async function callOpenAIJsonEdit(args: {
   const { apiKey, model, instruction, currentJson } = args;
 
   const system =
-    'You are a JSON editor. Your job is to update a prompt JSON object based on the user instruction. ' +
-    'Return ONLY valid JSON (no markdown). The output MUST be a JSON object with keys: ' +
-    'updatedJson (object), summary (string), changedPaths (array of strings). ' +
-    'Rules: preserve existing structure and values unless the instruction says to change them; ' +
-    'add new keys in the most appropriate section; do not remove data unless explicitly requested; ' +
-    'keep strings concise; use Indonesian for summary. ' +
-    'If instruction is ambiguous, make a reasonable minimal addition (e.g., create fields with empty strings) and mention it in summary.';
+    'You are a JSON editor. Update a prompt JSON object based on the user instruction.\n' +
+    'Return ONLY valid JSON (no markdown, no commentary).\n' +
+    'Your output MUST be an object with keys:\n' +
+    '- updatedJsonText: string (this must be a JSON string of the UPDATED object)\n' +
+    '- summary: string (Indonesian)\n' +
+    '- changedPaths: array of strings (dot-paths like "body.profile.height")\n' +
+    'Rules:\n' +
+    '- Preserve existing structure/values unless instruction asks to change.\n' +
+    '- Add new keys in the most appropriate section.\n' +
+    '- Do not remove data unless explicitly requested.\n' +
+    '- Keep strings concise.\n' +
+    '- If instruction is ambiguous, do minimal addition and mention it in summary.\n';
 
   const conventions = {
     knownSections: [
@@ -69,6 +81,7 @@ async function callOpenAIJsonEdit(args: {
       'global_negative_prompt'
     ],
     commonAdditions: {
+      // Example: "tambah profil body" -> add body.profile
       bodyProfileTemplate: {
         height: '',
         build: '',
@@ -84,27 +97,34 @@ async function callOpenAIJsonEdit(args: {
     text: {
       format: {
         type: 'json_schema' as const,
-        name: 'json_edit_result', // ✅ WAJIB
+        name: 'json_edit_result_v1',
         strict: true,
         schema: {
           type: 'object',
           additionalProperties: false,
           properties: {
-            updatedJson: { type: 'object' },
+            updatedJsonText: { type: 'string' },
             summary: { type: 'string' },
             changedPaths: { type: 'array', items: { type: 'string' } }
           },
-          required: ['updatedJson', 'summary', 'changedPaths']
+          required: ['updatedJsonText', 'summary', 'changedPaths']
         }
       }
     },
-
     max_output_tokens: 1200,
     input: [
-      { role: 'system', content: system + ' IMPORTANT: output must be JSON.' },
+      { role: 'system', content: system },
       {
         role: 'user',
-        content: JSON.stringify({ instruction, currentJson, conventions }, null, 2)
+        content: JSON.stringify(
+          {
+            instruction,
+            currentJson,
+            conventions
+          },
+          null,
+          2
+        )
       }
     ]
   };
@@ -132,17 +152,31 @@ async function callOpenAIJsonEdit(args: {
     throw new Error(`OpenAI returned empty output. status=${status} ${err}`);
   }
 
+  // Parse the model output JSON (outer object)
   let parsed: any;
   try {
     parsed = JSON.parse(out);
   } catch (e: any) {
-    const tail = out.slice(Math.max(0, out.length - 400));
+    const tail = out.slice(Math.max(0, out.length - 500));
     throw new Error(`Model returned invalid JSON: ${e?.message}. Tail: ${tail}`);
   }
 
-  const updatedJson = parsed?.updatedJson;
+  const updatedJsonText = parsed?.updatedJsonText;
+  if (typeof updatedJsonText !== 'string' || !updatedJsonText.trim()) {
+    throw new Error('Model output did not include updatedJsonText as a non-empty string');
+  }
+
+  // Parse updatedJsonText into object
+  let updatedJson: any;
+  try {
+    updatedJson = JSON.parse(updatedJsonText);
+  } catch (e: any) {
+    const tail = updatedJsonText.slice(Math.max(0, updatedJsonText.length - 500));
+    throw new Error(`updatedJsonText is not valid JSON: ${e?.message}. Tail: ${tail}`);
+  }
+
   if (typeof updatedJson !== 'object' || updatedJson == null || Array.isArray(updatedJson)) {
-    throw new Error('Model output did not include updatedJson as an object');
+    throw new Error('updatedJsonText did not parse into a JSON object');
   }
 
   const summary = typeof parsed?.summary === 'string' ? parsed.summary : '';
